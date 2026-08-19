@@ -30,6 +30,7 @@ import (
 
 	"seata.apache.org/seata-go/v2/pkg/datasource/sql/datasource"
 	"seata.apache.org/seata-go/v2/pkg/datasource/sql/types"
+	"seata.apache.org/seata-go/v2/pkg/datasource/sql/xa"
 	"seata.apache.org/seata-go/v2/pkg/protocol/branch"
 	"seata.apache.org/seata-go/v2/pkg/rm"
 	"seata.apache.org/seata-go/v2/pkg/util/log"
@@ -91,13 +92,12 @@ func (xaManager *XAResourceManager) xaTwoPhaseTimeoutChecker() {
 				if !ok {
 					return true
 				}
-				if source.IsShouldBeHeld() {
-					return true
-				}
-
 				source.GetKeeper().Range(func(key, value any) bool {
 					connectionXA, isConnectionXA := value.(*XAConn)
 					if !isConnectionXA {
+						return true
+					}
+					if connectionXA.ShouldBeHeld() {
 						return true
 					}
 
@@ -138,40 +138,84 @@ func (xaManager *XAResourceManager) xaIDBuilder(xid string, branchId uint64) XAX
 func (xaManager *XAResourceManager) finishBranch(ctx context.Context, xaID XAXid, branchResource rm.BranchResource) (*XAConn, error) {
 	resource, ok := xaManager.resourceCache.Load(branchResource.ResourceId)
 	if !ok {
-		err := fmt.Errorf("unknow resource for rollback xa, resourceId: %s", branchResource.ResourceId)
+		err := fmt.Errorf("unknown resource for XA phase two, resourceId: %s", branchResource.ResourceId)
 		log.Errorf(err.Error())
 		return nil, err
 	}
 
 	dbResource, ok := resource.(*DBResource)
 	if !ok {
-		err := fmt.Errorf("unknow resource for rollback xa, resourceId: %s", branchResource.ResourceId)
+		err := fmt.Errorf("invalid resource for XA phase two, resourceId: %s", branchResource.ResourceId)
 		log.Errorf(err.Error())
 		return nil, err
 	}
 
 	connectionProxyXA, err := dbResource.ConnectionForXA(ctx, xaID)
 	if err != nil {
-		err := fmt.Errorf("get connection for rollback xa, resourceId: %s", branchResource.ResourceId)
-		log.Errorf(err.Error())
-		return nil, err
+		wrappedErr := fmt.Errorf(
+			"get connection for XA phase two, resourceId: %s: %w",
+			branchResource.ResourceId,
+			err,
+		)
+		log.Errorf(wrappedErr.Error())
+		return nil, wrappedErr
 	}
 
 	return connectionProxyXA, nil
 }
 
+func phaseTwoErrorClassifier(connection *XAConn) (xa.XAPhaseTwoErrorClassifier, bool) {
+	classifier, ok := connection.xaErrorClassifier.(xa.XAPhaseTwoErrorClassifier)
+	return classifier, ok
+}
+
 func (xaManager *XAResourceManager) BranchCommit(ctx context.Context, branchResource rm.BranchResource) (branch.BranchStatus, error) {
 	xaID := xaManager.xaIDBuilder(branchResource.Xid, uint64(branchResource.BranchId))
+	if status, err := branchStatus(xaID.String()); err == nil {
+		switch status {
+		case branch.BranchStatusPhasetwoCommitted:
+			return branch.BranchStatusPhasetwoCommitted, nil
+		case branch.BranchStatusPhasetwoRollbacked:
+			return branch.BranchStatusPhasetwoCommitFailedUnretryable, fmt.Errorf(
+				"XA branch %s was already rolled back",
+				xaID.String(),
+			)
+		}
+	}
+
 	connectionProxyXA, err := xaManager.finishBranch(ctx, xaID, branchResource)
 	if err != nil {
-		return branch.BranchStatusPhasetwoRollbackFailedUnretryable, err
+		return branch.BranchStatusPhasetwoCommitFailedRetryable, err
 	}
-	defer connectionProxyXA.Close()
+	wasKept := connectionProxyXA.isKept()
+	if !wasKept {
+		defer connectionProxyXA.Close()
+	}
 
-	if err := connectionProxyXA.XaCommit(ctx, xaID); err != nil {
-		log.Errorf("commit xa, resourceId: %s, err %v", branchResource.ResourceId, err)
+	if err := connectionProxyXA.xaCommit(ctx, xaID, func() {
 		setBranchStatus(xaID.String(), branch.BranchStatusPhasetwoCommitted)
-		return branch.BranchStatusPhasetwoCommitFailedUnretryable, err
+	}); err != nil {
+		log.Errorf("commit xa, resourceId: %s, err %v", branchResource.ResourceId, err)
+		if classifier, ok := phaseTwoErrorClassifier(connectionProxyXA); ok {
+			switch {
+			case classifier.IsAlreadyCommitted(err):
+				connectionProxyXA.completePhaseTwoWith(func() {
+					setBranchStatus(xaID.String(), branch.BranchStatusPhasetwoCommitted)
+				})
+				return branch.BranchStatusPhasetwoCommitted, nil
+			case classifier.IsAlreadyRollbacked(err):
+				connectionProxyXA.completePhaseTwoWith(func() {
+					setBranchStatus(xaID.String(), branch.BranchStatusPhasetwoRollbacked)
+				})
+				return branch.BranchStatusPhasetwoCommitFailedUnretryable, err
+			case classifier.IsUnretryable(err):
+				if closeErr := connectionProxyXA.CloseForce(); closeErr != nil {
+					log.Errorf("close XA connection after unretryable commit failure: %v", closeErr)
+				}
+				return branch.BranchStatusPhasetwoCommitFailedUnretryable, err
+			}
+		}
+		return branch.BranchStatusPhasetwoCommitFailedRetryable, err
 	}
 
 	log.Infof("%s was committed", xaID.String())
@@ -180,16 +224,51 @@ func (xaManager *XAResourceManager) BranchCommit(ctx context.Context, branchReso
 
 func (xaManager *XAResourceManager) BranchRollback(ctx context.Context, branchResource rm.BranchResource) (branch.BranchStatus, error) {
 	xaID := xaManager.xaIDBuilder(branchResource.Xid, uint64(branchResource.BranchId))
+	if status, err := branchStatus(xaID.String()); err == nil {
+		switch status {
+		case branch.BranchStatusPhasetwoRollbacked:
+			return branch.BranchStatusPhasetwoRollbacked, nil
+		case branch.BranchStatusPhasetwoCommitted:
+			return branch.BranchStatusPhasetwoRollbackFailedUnretryable, fmt.Errorf(
+				"XA branch %s was already committed",
+				xaID.String(),
+			)
+		}
+	}
+
 	connectionProxyXA, err := xaManager.finishBranch(ctx, xaID, branchResource)
 	if err != nil {
-		return branch.BranchStatusPhasetwoRollbackFailedUnretryable, err
+		return branch.BranchStatusPhasetwoRollbackFailedRetryable, err
 	}
-	defer connectionProxyXA.Close()
+	wasKept := connectionProxyXA.isKept()
+	if !wasKept {
+		defer connectionProxyXA.Close()
+	}
 
-	if err = connectionProxyXA.XaRollbackByBranchId(ctx, xaID); err != nil {
-		log.Errorf("rollback xa, resourceId: %s, err %v", branchResource.ResourceId, err)
+	if err = connectionProxyXA.xaRollback(ctx, xaID, func() {
 		setBranchStatus(xaID.String(), branch.BranchStatusPhasetwoRollbacked)
-		return branch.BranchStatusPhasetwoRollbackFailedUnretryable, err
+	}); err != nil {
+		log.Errorf("rollback xa, resourceId: %s, err %v", branchResource.ResourceId, err)
+		if classifier, ok := phaseTwoErrorClassifier(connectionProxyXA); ok {
+			switch {
+			case classifier.IsAlreadyRollbacked(err):
+				connectionProxyXA.completePhaseTwoWith(func() {
+					setBranchStatus(xaID.String(), branch.BranchStatusPhasetwoRollbacked)
+				})
+				return branch.BranchStatusPhasetwoRollbacked, nil
+			case classifier.IsAlreadyCommitted(err):
+				connectionProxyXA.completePhaseTwoWith(func() {
+					setBranchStatus(xaID.String(), branch.BranchStatusPhasetwoCommitted)
+				})
+				return branch.BranchStatusPhasetwoRollbackFailedUnretryable, err
+			case classifier.IsUnretryable(err):
+				if closeErr := connectionProxyXA.CloseForce(); closeErr != nil {
+					log.Errorf("close XA connection after unretryable rollback failure: %v", closeErr)
+				}
+				return branch.BranchStatusPhasetwoRollbackFailedUnretryable, err
+			}
+		}
+		return branch.BranchStatusPhasetwoRollbackFailedRetryable, err
 	}
 
 	log.Infof("%s was rollback", xaID.String())
