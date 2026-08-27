@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"seata.apache.org/seata-go/v2/pkg/datasource/sql/types"
+	"seata.apache.org/seata-go/v2/pkg/datasource/sql/util"
 	"seata.apache.org/seata-go/v2/pkg/datasource/sql/xa"
 	"seata.apache.org/seata-go/v2/pkg/protocol/branch"
 	"seata.apache.org/seata-go/v2/pkg/tm"
@@ -383,7 +384,7 @@ func (c *XAConn) queryPreparedInBranch(ctx context.Context, query string, args [
 		_ = stmt.Close()
 		return nil, err
 	}
-	return types.NewResult(types.WithRows(&rowsWithStmt{Rows: rows, stmt: stmt})), nil
+	return types.NewResult(types.WithRows(util.NewRowsWithStmt(rows, stmt))), nil
 }
 
 // xaDeferredCommitTx wraps an XA branch tx whose commit is deferred until the
