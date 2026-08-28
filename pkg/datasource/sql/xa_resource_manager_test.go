@@ -22,6 +22,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -246,6 +247,82 @@ func TestXAResourceManager_LockQuery(t *testing.T) {
 				assert.NoError(t, err)
 			} else {
 				assert.EqualError(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestXAResourceManager_CloseTimedOutPhaseTwoConnections(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name              string
+		prepared          bool
+		holdUntilPhaseTwo bool
+		preparedAt        time.Time
+		wantClosed        bool
+	}{
+		{
+			name:       "unprepared keeper entry is ignored",
+			preparedAt: time.Time{},
+		},
+		{
+			name:              "mandatory owner is retained",
+			prepared:          true,
+			holdUntilPhaseTwo: true,
+			preparedAt:        now.Add(-time.Minute),
+		},
+		{
+			name:       "recent detachable branch is retained",
+			prepared:   true,
+			preparedAt: now.Add(-500 * time.Millisecond),
+		},
+		{
+			name:       "expired detachable branch is force closed",
+			prepared:   true,
+			preparedAt: now.Add(-2 * time.Second),
+			wantClosed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			underlying := &closeErrorDriverConn{}
+			xaID := XaIdBuild("127.0.0.1:8091:1001", 123)
+			resource := &DBResource{
+				resourceID:   "mysql://127.0.0.1/test",
+				dbType:       types.DBTypeMySQL,
+				keepInKeeper: true,
+			}
+			xaConn := &XAConn{
+				Conn: &Conn{
+					targetConn: underlying,
+					res:        resource,
+					dbType:     types.DBTypeMySQL,
+				},
+				xaBranchXid:         xaID,
+				keepInKeeper:        true,
+				shouldBeHeld:        tt.holdUntilPhaseTwo,
+				isConnKept:          true,
+				preparedForPhaseTwo: tt.prepared,
+				prepareTime:         tt.preparedAt,
+			}
+			assert.NoError(t, resource.Hold(xaID.String(), xaConn))
+
+			manager := &XAResourceManager{
+				config: XAConfig{TwoPhaseHoldTime: time.Second},
+			}
+			manager.resourceCache.Store(resource.resourceID, resource)
+
+			manager.closeTimedOutPhaseTwoConnections(now)
+
+			if tt.wantClosed {
+				assert.Equal(t, int32(1), atomic.LoadInt32(&underlying.closeCalls))
+				_, held := resource.Lookup(xaID.String())
+				assert.False(t, held)
+			} else {
+				assert.Equal(t, int32(0), atomic.LoadInt32(&underlying.closeCalls))
+				_, held := resource.Lookup(xaID.String())
+				assert.True(t, held)
 			}
 		})
 	}

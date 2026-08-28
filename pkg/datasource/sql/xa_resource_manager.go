@@ -87,31 +87,36 @@ func (xaManager *XAResourceManager) xaTwoPhaseTimeoutChecker() {
 	for {
 		select {
 		case <-ticker.C:
-			xaManager.resourceCache.Range(func(key, value any) bool {
-				source, ok := value.(*DBResource)
-				if !ok {
-					return true
-				}
-				source.GetKeeper().Range(func(key, value any) bool {
-					connectionXA, isConnectionXA := value.(*XAConn)
-					if !isConnectionXA {
-						return true
-					}
-					if connectionXA.ShouldBeHeld() {
-						return true
-					}
-
-					if time.Now().Sub(connectionXA.prepareTime) > xaManager.config.TwoPhaseHoldTime {
-						if err := connectionXA.CloseForce(); err != nil {
-							log.Errorf("Force close the xa xid:%s physical connection fail", connectionXA.txCtx.XID)
-						}
-					}
-					return true
-				})
-				return true
-			})
+			xaManager.closeTimedOutPhaseTwoConnections(time.Now())
 		}
 	}
+}
+
+func (xaManager *XAResourceManager) closeTimedOutPhaseTwoConnections(now time.Time) {
+	xaManager.resourceCache.Range(func(key, value any) bool {
+		source, ok := value.(*DBResource)
+		if !ok {
+			return true
+		}
+		source.GetKeeper().Range(func(key, value any) bool {
+			connectionXA, isConnectionXA := value.(*XAConn)
+			if !isConnectionXA {
+				return true
+			}
+			prepared, holdUntilPhaseTwo, preparedAt := connectionXA.phaseTwoTimeoutSnapshot()
+			if !prepared || holdUntilPhaseTwo {
+				return true
+			}
+
+			if now.Sub(preparedAt) > xaManager.config.TwoPhaseHoldTime {
+				if err := connectionXA.CloseForce(); err != nil {
+					log.Errorf("Force close the XA physical connection: %v", err)
+				}
+			}
+			return true
+		})
+		return true
+	})
 }
 
 func (xaManager *XAResourceManager) GetBranchType() branch.BranchType {

@@ -118,6 +118,7 @@ type DBResource struct {
 
 	// for xa
 	metaCache              datasource.TableMetaCache
+	keepInKeeper           bool
 	shouldBeHeld           bool
 	probeXADetachOnPrepare bool
 	keeper                 sync.Map // xaBranchID -> *XAConn
@@ -140,8 +141,10 @@ func (db *DBResource) init() {
 		log.Errorf("select db version: %v", err)
 	}
 	db.SetDbVersion(version)
-	if err := db.checkDbVersion(ctx, conn); err != nil {
-		log.Errorf("check db version and XA capabilities: %v", err)
+	if db.branchType == branch.BranchTypeXA {
+		if err := db.checkDbVersion(ctx, conn); err != nil {
+			log.Errorf("check db version and XA capabilities: %v", err)
+		}
 	}
 }
 
@@ -245,6 +248,7 @@ func (db *DBResource) ConnectionForXA(ctx context.Context, xaXid XAXid) (*XAConn
 func (db *DBResource) checkDbVersion(ctx context.Context, conn driver.Conn) error {
 	switch db.dbType {
 	case types.DBTypeMySQL:
+		db.keepInKeeper = true
 		// Conservatively keep the owner unless both the version and the effective
 		// session variable prove that cross-connection phase two is supported.
 		db.shouldBeHeld = true
@@ -268,6 +272,7 @@ func (db *DBResource) checkDbVersion(ctx context.Context, conn driver.Conn) erro
 			db.shouldBeHeld = !detachOnPrepare
 		}
 	case types.DBTypeMARIADB:
+		db.keepInKeeper = true
 		db.shouldBeHeld = true
 	}
 	return nil

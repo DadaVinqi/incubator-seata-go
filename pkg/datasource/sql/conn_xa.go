@@ -43,19 +43,21 @@ var errXABranchLifecycleManaged = errors.New("xa branch lifecycle is managed by 
 type XAConn struct {
 	*Conn
 
-	tx                 driver.Tx
-	xaResource         xa.XAResource
-	xaErrorClassifier  xa.XAErrorClassifier
-	xaBranchXid        *XABranchXid
-	xaActive           bool
-	rollBacked         bool
-	branchRegisterTime time.Time
-	prepareTime        time.Time
-	keeperMu           sync.Mutex
-	shouldBeHeld       bool
-	isConnKept         bool
-	poolDiscarded      bool
-	physicalClosed     bool
+	tx                  driver.Tx
+	xaResource          xa.XAResource
+	xaErrorClassifier   xa.XAErrorClassifier
+	xaBranchXid         *XABranchXid
+	xaActive            bool
+	rollBacked          bool
+	branchRegisterTime  time.Time
+	prepareTime         time.Time
+	keeperMu            sync.Mutex
+	keepInKeeper        bool
+	shouldBeHeld        bool
+	isConnKept          bool
+	preparedForPhaseTwo bool
+	poolDiscarded       bool
+	physicalClosed      bool
 }
 
 // xaBranchTx is a sentinel driver.Tx used to satisfy database/sql wiring while
@@ -439,6 +441,7 @@ func (c *XAConn) isKept() bool {
 }
 
 func (c *XAConn) configureConnectionHold(ctx context.Context) {
+	c.keepInKeeper = c.res.keepInKeeper
 	c.shouldBeHeld = c.res.IsShouldBeHeld()
 	if !c.res.probeXADetachOnPrepare {
 		return
@@ -461,7 +464,7 @@ func (c *XAConn) keepIfNecessary() {
 	if c.xaBranchXid == nil {
 		return
 	}
-	if c.ShouldBeHeld() {
+	if c.keepInKeeper {
 		if err := c.res.Hold(c.xaBranchXid.String(), c); err == nil {
 			c.isConnKept = true
 		}
@@ -544,6 +547,7 @@ func (c *XAConn) cleanXABranchContextLocked() {
 	h, _ := time.ParseDuration("-1000h")
 	c.branchRegisterTime = time.Now().Add(h)
 	c.prepareTime = time.Now().Add(h)
+	c.preparedForPhaseTwo = false
 	c.xaActive = false
 	if !c.isConnKept {
 		c.xaBranchXid = nil
@@ -610,16 +614,16 @@ func (c *XAConn) Commit(ctx context.Context) error {
 		return c.commitErrorHandle(ctx, err)
 	}
 
+	c.keeperMu.Lock()
 	c.prepareTime = time.Now()
+	c.preparedForPhaseTwo = true
 
 	// Phase-1 is done: this session no longer has an in-flight XA branch. Clear
-	// only the session-active flag so a subsequent autoCommit statement on the
-	// same (possibly pooled/reused) connection can open a fresh branch instead of
-	// tripping the "xa branch is active" guard in BeginTx. The branch itself is
-	// still prepared and, when held, retrievable for phase-2 via xaBranchXid, so
-	// we must NOT call cleanXABranchContext here (that would reset prepareTime and
-	// drop xaBranchXid). Phase-2 XaCommit/XaRollback do not depend on xaActive.
+	// only the session-active flag so a subsequent autoCommit statement on a
+	// connection that was not transferred to the keeper can open a fresh branch.
+	// Held and temporarily cached branches remain addressable for phase two.
 	c.xaActive = false
+	c.keeperMu.Unlock()
 
 	return nil
 }
@@ -640,6 +644,12 @@ func (c *XAConn) ShouldBeHeld() bool {
 	return c.shouldBeHeld
 }
 
+func (c *XAConn) phaseTwoTimeoutSnapshot() (prepared bool, holdUntilPhaseTwo bool, preparedAt time.Time) {
+	c.keeperMu.Lock()
+	defer c.keeperMu.Unlock()
+	return c.preparedForPhaseTwo, c.shouldBeHeld, c.prepareTime
+}
+
 func (c *XAConn) checkTimeout(ctx context.Context, now time.Time) error {
 	if now.Sub(c.branchRegisterTime) > xaConnTimeout {
 		c.XaRollback(ctx, c.xaBranchXid)
@@ -653,7 +663,7 @@ func (c *XAConn) Close() error {
 	defer c.keeperMu.Unlock()
 
 	c.rollBacked = false
-	if c.isConnKept && c.ShouldBeHeld() {
+	if c.isConnKept {
 		c.poolDiscarded = true
 		return nil
 	}
@@ -733,6 +743,7 @@ func (c *XAConn) completePhaseTwoWith(beforeRelease func()) {
 
 func (c *XAConn) completePhaseTwoLocked() {
 	c.releaseIfNecessaryLocked()
+	c.preparedForPhaseTwo = false
 	if c.poolDiscarded {
 		if err := c.closePhysicalLocked(); err != nil {
 			log.Errorf("close discarded XA connection after phase two: %v", err)
