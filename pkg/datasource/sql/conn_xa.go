@@ -641,7 +641,7 @@ func (c *XAConn) commitErrorHandle(ctx context.Context, cause error) error {
 }
 
 func (c *XAConn) ShouldBeHeld() bool {
-	return c.shouldBeHeld
+	return c.shouldBeHeld || c.res.GetDbType() == types.DBTypeUnknown
 }
 
 func (c *XAConn) phaseTwoTimeoutSnapshot() (prepared bool, holdUntilPhaseTwo bool, preparedAt time.Time) {
